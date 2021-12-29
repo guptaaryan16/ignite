@@ -19,6 +19,7 @@ from ignite.handlers.param_scheduler import (
     PiecewiseLinear,
     ReduceLROnPlateauScheduler,
 )
+from ignite.handlers.pytorch_profiler import PyTorchProfiler
 from ignite.handlers.state_param_scheduler import (
     ExpStateScheduler,
     LambdaStateScheduler,
