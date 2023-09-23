@@ -2,8 +2,8 @@ from ignite.contrib.handlers.clearml_logger import ClearMLLogger
 from ignite.contrib.handlers.mlflow_logger import MLflowLogger
 from ignite.contrib.handlers.neptune_logger import NeptuneLogger
 from ignite.contrib.handlers.polyaxon_logger import PolyaxonLogger
-from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger
 from ignite.contrib.handlers.pytorch_profiler import PyTorchProfiler
+from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger
 
 from ignite.contrib.handlers.tqdm_logger import ProgressBar
 

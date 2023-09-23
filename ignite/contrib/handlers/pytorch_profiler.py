@@ -90,8 +90,8 @@ class PyTorchProfiler:
                 print(output)
                 p.export_chrome_trace("/tmp/trace_" + str(p.step_num) + ".json")
             pt_profiler = PyTorchProfiler(on_trace_ready=trace_handler, output_path="logs/train")
-    
-    For more information check 
+
+    For more information check
 
     .. versionadded:: 0.4.13
     """
@@ -187,7 +187,6 @@ class PyTorchProfiler:
             "count",
         }
 
-    
     def _profiler_create(self):
         self._profiler = torch.profiler.profile(
             activities=self._activities,
@@ -207,7 +206,6 @@ class PyTorchProfiler:
 
     def _profiler_step(self):
         self._profiler.step()
-
 
     def attach(
         self,

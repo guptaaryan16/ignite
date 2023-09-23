@@ -3,8 +3,9 @@ import os
 import pytest
 import torch
 
-from ignite.engine import Engine
 from ignite.contrib.handlers import PyTorchProfiler
+
+from ignite.engine import Engine
 
 
 def clean_string(s):
@@ -78,7 +79,9 @@ def get_both_profiler_outputs(data_len, path, epoch, wait=1, warmup=1, active=3,
 
     if not torch.cuda.is_available():
         with pytest.warns(UserWarning):
-            ref_output = _check_profiler_output(data, "cpu_time", wait=wait, warmup=warmup, active=active, repeat=repeat)
+            ref_output = _check_profiler_output(
+                data, "cpu_time", wait=wait, warmup=warmup, active=active, repeat=repeat
+            )
     else:
         ref_output = _check_profiler_output(data, "cpu_time", wait=wait, warmup=warmup, active=active, repeat=repeat)
     return ref_output, output_string
@@ -143,12 +146,12 @@ def test_schedule(epoch, tmp_path, wait, warmup, active, repeat):
 
     output_dict = _output_string_to_dict(output_string)
     ref_output_dict = _output_string_to_dict(ref_output)
-    print('Output Dict')
+    print("Output Dict")
     print(output_dict)
-    print('=======================================')
-    print('ref_output')
+    print("=======================================")
+    print("ref_output")
     print(ref_output_dict)
-    print('======================================')
+    print("======================================")
 
     for _key in output_dict.keys():
         assert output_dict[_key][-2] == ref_output_dict[_key][-2]
