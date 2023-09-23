@@ -4,26 +4,26 @@ import pytest
 import torch
 
 from ignite.engine import Engine
-from ignite.handlers import PyTorchProfiler
+from ignite.contrib.handlers import PyTorchProfiler
 
 
 def clean_string(s):
     return s.lstrip().rstrip()
 
 
-def update_fn(engine, batch):
+def _update_fn(engine, batch):
     x = torch.randn((1, 8), requires_grad=True)
     y = torch.randn((8, 1), requires_grad=True)
     z = torch.matmul(x, y)
     z.backward()
 
 
-def get_engine():
-    dummy_trainer = Engine(update_fn)
+def _get_engine():
+    dummy_trainer = Engine(_update_fn)
     return dummy_trainer
 
 
-def output_string_to_dict(output_string):
+def _output_string_to_dict(output_string):
     output_string = output_string.split("\n")
 
     # Removing the formatting and headers
@@ -40,7 +40,7 @@ def output_string_to_dict(output_string):
     return output_string_split
 
 
-def check_profiler_output(data, sort_key="cpu_time", wait=1, warmup=1, active=3, repeat=1):
+def _check_profiler_output(data, sort_key="cpu_time", wait=1, warmup=1, active=3, repeat=1):
     # Returns output of PyTorch Profiler directly (Without using Ignite handler) for comparison
 
     from torch.profiler import profile, ProfilerActivity, schedule
@@ -61,7 +61,7 @@ def check_profiler_output(data, sort_key="cpu_time", wait=1, warmup=1, active=3,
 
 def get_both_profiler_outputs(data_len, path, epoch, wait=1, warmup=1, active=3, repeat=1):
     data = [i for i in range(data_len)]
-    trainer = get_engine()
+    trainer = _get_engine()
     pt_profiler = PyTorchProfiler(
         on_trace_ready="tensorboard",
         output_path=path,
@@ -78,9 +78,9 @@ def get_both_profiler_outputs(data_len, path, epoch, wait=1, warmup=1, active=3,
 
     if not torch.cuda.is_available():
         with pytest.warns(UserWarning):
-            ref_output = check_profiler_output(data, "cpu_time", wait=wait, warmup=warmup, active=active, repeat=repeat)
+            ref_output = _check_profiler_output(data, "cpu_time", wait=wait, warmup=warmup, active=active, repeat=repeat)
     else:
-        ref_output = check_profiler_output(data, "cpu_time", wait=wait, warmup=warmup, active=active, repeat=repeat)
+        ref_output = _check_profiler_output(data, "cpu_time", wait=wait, warmup=warmup, active=active, repeat=repeat)
     return ref_output, output_string
 
 
@@ -111,14 +111,14 @@ def test_profilers_wrong_inputs():
 def test_get_results(epoch, data_len, tmp_path):
     ref_output, output_string = get_both_profiler_outputs(data_len, tmp_path, epoch)
     print(output_string, ref_output)
-    output_dict = output_string_to_dict(output_string)
-    ref_output_dict = output_string_to_dict(ref_output)
+    output_dict = _output_string_to_dict(output_string)
+    ref_output_dict = _output_string_to_dict(ref_output)
 
     for _key in output_dict.keys():
         # Checks number of calls are same in both profilers
-        assert output_dict[_key][5] == ref_output_dict[_key][5]
+        assert output_dict[_key][-2] == ref_output_dict[_key][-2]
         # Checks shapes
-        assert output_dict[_key][6] == ref_output_dict[_key][6]
+        assert output_dict[_key][-1] == ref_output_dict[_key][-1]
 
     # Check number of elements recorded
     assert len(output_dict) == len(ref_output_dict)
@@ -127,7 +127,7 @@ def test_get_results(epoch, data_len, tmp_path):
 @pytest.mark.parametrize("wait,warmup,active,repeat", [(99, 2, 1, 1), (2, 99, 1, 1), (99, 2, 1, 2)])
 @pytest.mark.parametrize("epoch", [1, 2, 10])
 def test_none_output(epoch, tmp_path, wait, warmup, active, repeat):
-    trainer = get_engine()
+    trainer = _get_engine()
     pt_profiler = PyTorchProfiler(
         on_trace_ready="tensorboard", output_path=tmp_path, wait=wait, warmup=warmup, active=active, repeat=repeat
     )
@@ -141,13 +141,18 @@ def test_none_output(epoch, tmp_path, wait, warmup, active, repeat):
 def test_schedule(epoch, tmp_path, wait, warmup, active, repeat):
     ref_output, output_string = get_both_profiler_outputs(100, tmp_path, epoch, wait, warmup, active, repeat)
 
-    output_dict = output_string_to_dict(output_string)
-    ref_output_dict = output_string_to_dict(ref_output)
-    print(output_string, ref_output)
+    output_dict = _output_string_to_dict(output_string)
+    ref_output_dict = _output_string_to_dict(ref_output)
+    print('Output Dict')
+    print(output_dict)
+    print('=======================================')
+    print('ref_output')
+    print(ref_output_dict)
+    print('======================================')
 
     for _key in output_dict.keys():
-        assert output_dict[_key][5] == ref_output_dict[_key][5], print(_key)
-        assert output_dict[_key][6] == ref_output_dict[_key][6]
+        assert output_dict[_key][-2] == ref_output_dict[_key][-2]
+        assert output_dict[_key][-1] == ref_output_dict[_key][-1]
 
     # Check number of elements recorded
     assert len(output_dict) == len(ref_output_dict)
@@ -156,7 +161,7 @@ def test_schedule(epoch, tmp_path, wait, warmup, active, repeat):
 @pytest.mark.parametrize("epoch", [1, 5, 100])
 def test_multiple_epochs_files(epoch, tmp_path):
     # Number of files should be same as epochs
-    trainer = get_engine()
+    trainer = _get_engine()
     pt_profiler = PyTorchProfiler(on_trace_ready="tensorboard", output_path=tmp_path, with_stack=True)
     pt_profiler.attach(trainer)
     trainer.run(range(20), max_epochs=epoch)
@@ -166,7 +171,7 @@ def test_multiple_epochs_files(epoch, tmp_path):
 @pytest.mark.parametrize("n", [1, 5, 10])
 def test_write_results(n, tmp_path):
     # File Length should be equal to n (row limit)
-    trainer = get_engine()
+    trainer = _get_engine()
     pt_profiler = PyTorchProfiler(on_trace_ready="tensorboard", output_path=tmp_path, file_name="testing_file")
     pt_profiler.attach(trainer)
     trainer.run(range(10), max_epochs=1)
