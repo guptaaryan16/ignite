@@ -305,7 +305,7 @@ def spawn(
 
     .. _dist.init_process_group: https://pytorch.org/docs/stable/distributed.html#torch.distributed.init_process_group
     .. _mp.start_processes: https://pytorch.org/docs/stable/multiprocessing.html#torch.multiprocessing.spawn
-    .. _xmp.spawn: http://pytorch.org/xla/release/1.6/index.html#torch_xla.distributed.xla_multiprocessing.spawn
+    .. _xmp.spawn: https://pytorch.org/xla/release/1.6/index.html#torch_xla.distributed.xla_multiprocessing.spawn
     .. _hvd_run: https://horovod.readthedocs.io/en/latest/api.html#module-horovod.run
 
     .. versionchanged:: 0.4.2
@@ -351,8 +351,8 @@ def all_reduce(
 
 
 def all_gather(
-    tensor: Union[torch.Tensor, float, str], group: Optional[Union[Any, List[int]]] = None
-) -> Union[torch.Tensor, float, List[float], List[str]]:
+    tensor: Union[torch.Tensor, float, str, Any], group: Optional[Union[Any, List[int]]] = None
+) -> Union[torch.Tensor, float, List[float], List[str], List[Any]]:
     """Helper method to perform all gather operation.
 
     Args:
@@ -664,7 +664,7 @@ def one_rank_first(rank: int = 0, local: bool = False) -> Any:
 
             dp = ds[0]
 
-    .. versionadded:: 0.5.0
+    .. versionadded:: 0.4.13
     """
 
     current_rank = get_local_rank() if local else get_rank()

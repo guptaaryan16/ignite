@@ -1,18 +1,31 @@
 from abc import ABCMeta, abstractmethod
+from collections import OrderedDict
 from collections.abc import Mapping
 from functools import wraps
 from numbers import Number
-from typing import Any, Callable, cast, Dict, Optional, Sequence, Tuple, TYPE_CHECKING, Union
+from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING, Union
 
 import torch
 
 import ignite.distributed as idist
+
+from ignite.base.mixins import Serializable
 from ignite.engine import CallableEventWithFilter, Engine, Events
+from ignite.utils import _CollectionItem, _tree_apply2, _tree_map
 
 if TYPE_CHECKING:
     from ignite.metrics.metrics_lambda import MetricsLambda
 
-__all__ = ["Metric", "MetricUsage", "EpochWise", "BatchWise", "BatchFiltered"]
+__all__ = [
+    "Metric",
+    "MetricUsage",
+    "EpochWise",
+    "BatchWise",
+    "BatchFiltered",
+    "RunningEpochWise",
+    "RunningBatchWise",
+    "SingleEpochRunningBatchWise",
+]
 
 
 class MetricUsage:
@@ -30,6 +43,8 @@ class MetricUsage:
         iteration_completed: event when the metric updates. This event will be associated to
             :meth:`~ignite.metrics.metric.Metric.iteration_completed`.
     """
+
+    usage_name: str
 
     def __init__(self, started: Events, completed: Events, iteration_completed: CallableEventWithFilter) -> None:
         self.__started = started
@@ -74,6 +89,33 @@ class EpochWise(MetricUsage):
         )
 
 
+class RunningEpochWise(EpochWise):
+    """
+    Running epoch-wise usage of Metrics. It's the running version of the :class:`~.metrics.metric.EpochWise` metric
+    usage. A metric with such a usage most likely accompanies an :class:`~.metrics.metric.EpochWise` one to compute
+    a running measure of it e.g. running average.
+
+    Metric's methods are triggered on the following engine events:
+
+    - :meth:`~ignite.metrics.metric.Metric.started` on every ``STARTED``
+      (See :class:`~ignite.engine.events.Events`).
+    - :meth:`~ignite.metrics.metric.Metric.iteration_completed` on every ``EPOCH_COMPLETED``.
+    - :meth:`~ignite.metrics.metric.Metric.completed` on every ``EPOCH_COMPLETED``.
+
+    Attributes:
+        usage_name: usage name string
+    """
+
+    usage_name: str = "running_epoch_wise"
+
+    def __init__(self) -> None:
+        super(EpochWise, self).__init__(
+            started=Events.STARTED,
+            completed=Events.EPOCH_COMPLETED,
+            iteration_completed=Events.EPOCH_COMPLETED,
+        )
+
+
 class BatchWise(MetricUsage):
     """
     Batch-wise usage of Metrics.
@@ -94,6 +136,59 @@ class BatchWise(MetricUsage):
     def __init__(self) -> None:
         super(BatchWise, self).__init__(
             started=Events.ITERATION_STARTED,
+            completed=Events.ITERATION_COMPLETED,
+            iteration_completed=Events.ITERATION_COMPLETED,
+        )
+
+
+class RunningBatchWise(BatchWise):
+    """
+    Running batch-wise usage of Metrics. It's the running version of the :class:`~.metrics.metric.EpochWise` metric
+    usage. A metric with such a usage could for example accompany a :class:`~.metrics.metric.BatchWise` one to compute
+    a running measure of it e.g. running average.
+
+    Metric's methods are triggered on the following engine events:
+
+    - :meth:`~ignite.metrics.metric.Metric.started` on every ``STARTED``
+      (See :class:`~ignite.engine.events.Events`).
+    - :meth:`~ignite.metrics.metric.Metric.iteration_completed` on every ``ITERATION_COMPLETED``.
+    - :meth:`~ignite.metrics.metric.Metric.completed` on every ``ITERATION_COMPLETED``.
+
+    Attributes:
+        usage_name: usage name string
+    """
+
+    usage_name: str = "running_batch_wise"
+
+    def __init__(self) -> None:
+        super(BatchWise, self).__init__(
+            started=Events.STARTED,
+            completed=Events.ITERATION_COMPLETED,
+            iteration_completed=Events.ITERATION_COMPLETED,
+        )
+
+
+class SingleEpochRunningBatchWise(BatchWise):
+    """
+    Running batch-wise usage of Metrics in a single epoch. It's like :class:`~.metrics.metric.RunningBatchWise` metric
+    usage with the difference that is used during a single epoch.
+
+    Metric's methods are triggered on the following engine events:
+
+    - :meth:`~ignite.metrics.metric.Metric.started` on every ``EPOCH_STARTED``
+      (See :class:`~ignite.engine.events.Events`).
+    - :meth:`~ignite.metrics.metric.Metric.iteration_completed` on every ``ITERATION_COMPLETED``.
+    - :meth:`~ignite.metrics.metric.Metric.completed` on every ``ITERATION_COMPLETED``.
+
+    Attributes:
+        usage_name: usage name string
+    """
+
+    usage_name: str = "single_epoch_running_batch_wise"
+
+    def __init__(self) -> None:
+        super(BatchWise, self).__init__(
+            started=Events.EPOCH_STARTED,
             completed=Events.ITERATION_COMPLETED,
             iteration_completed=Events.ITERATION_COMPLETED,
         )
@@ -125,7 +220,7 @@ class BatchFiltered(MetricUsage):
         )
 
 
-class Metric(metaclass=ABCMeta):
+class Metric(Serializable, metaclass=ABCMeta):
     """
     Base class for all Metrics.
 
@@ -344,12 +439,16 @@ class Metric(metaclass=ABCMeta):
 
     def _check_usage(self, usage: Union[str, MetricUsage]) -> MetricUsage:
         if isinstance(usage, str):
-            if usage == EpochWise.usage_name:
-                usage = EpochWise()
-            elif usage == BatchWise.usage_name:
-                usage = BatchWise()
-            else:
-                raise ValueError(f"usage should be 'EpochWise.usage_name' or 'BatchWise.usage_name', get {usage}")
+            usages = [EpochWise, RunningEpochWise, BatchWise, RunningBatchWise, SingleEpochRunningBatchWise]
+            for usage_cls in usages:
+                if usage == usage_cls.usage_name:
+                    usage = usage_cls()
+                    break
+            if not isinstance(usage, MetricUsage):
+                raise ValueError(
+                    "Argument usage should be '(Running)EpochWise.usage_name' or "
+                    f"'((SingleEpoch)Running)BatchWise.usage_name', got {usage}"
+                )
         if not isinstance(usage, MetricUsage):
             raise TypeError(f"Unhandled usage type {type(usage)}")
         return usage
@@ -450,6 +549,97 @@ class Metric(metaclass=ABCMeta):
         """
         usage = self._check_usage(usage)
         return engine.has_event_handler(self.completed, usage.COMPLETED)
+
+    def _state_dict_per_rank(self) -> OrderedDict:
+        def func(
+            x: Union[torch.Tensor, Metric, None, float], **kwargs: Any
+        ) -> Union[torch.Tensor, float, OrderedDict, None]:
+            if isinstance(x, Metric):
+                return x._state_dict_per_rank()
+            if x is None or isinstance(x, (int, float, torch.Tensor)):
+                return x
+            else:
+                raise TypeError(
+                    "Found attribute of unsupported type. Currently, supported types include"
+                    " numeric types, tensor, Metric or sequence/mapping of metrics."
+                )
+
+        state: OrderedDict[str, Union[torch.Tensor, List, Dict, None]] = OrderedDict()
+        for attr_name in self._state_dict_all_req_keys:
+            if attr_name not in self.__dict__:
+                raise ValueError(
+                    f"Found a value in _state_dict_all_req_keys that is not among metric attributes: {attr_name}"
+                )
+            attr = getattr(self, attr_name)
+            state[attr_name] = _tree_map(func, attr)  # type: ignore[assignment]
+
+        return state
+
+    __state_dict_key_per_rank: str = "__metric_state_per_rank"
+
+    def state_dict(self) -> OrderedDict:
+        """Method returns state dict with attributes of the metric specified in its
+        `_state_dict_all_req_keys` attribute. Can be used to save internal state of the class.
+        """
+        state = self._state_dict_per_rank()
+
+        if idist.get_world_size() > 1:
+            return OrderedDict([(Metric.__state_dict_key_per_rank, idist.all_gather(state))])
+        return OrderedDict([(Metric.__state_dict_key_per_rank, [state])])
+
+    def _load_state_dict_per_rank(self, state_dict: Mapping) -> None:
+        super().load_state_dict(state_dict)
+
+        def func(x: Any, y: Any) -> None:
+            if isinstance(x, Metric):
+                x._load_state_dict_per_rank(y)
+            elif isinstance(x, _CollectionItem):
+                value = x.value()
+                if y is None or isinstance(y, _CollectionItem.types_as_collection_item):
+                    x.load_value(y)
+                elif isinstance(value, Metric):
+                    value._load_state_dict_per_rank(y)
+                else:
+                    raise ValueError(f"Unsupported type for provided state_dict data: {type(y)}")
+
+        for attr_name in self._state_dict_all_req_keys:
+            attr = getattr(self, attr_name)
+            attr = _CollectionItem.wrap(self.__dict__, attr_name, attr)
+            _tree_apply2(func, attr, state_dict[attr_name])
+
+    def load_state_dict(self, state_dict: Mapping) -> None:
+        """Method replaces internal state of the class with provided state dict data.
+
+        If there's an active distributed configuration, the process uses its rank to pick the proper value from
+        the list of values saved under each attribute's name in the dict.
+
+        Args:
+            state_dict: a dict containing attributes of the metric specified in its `_state_dict_all_req_keys`
+                attribute.
+        """
+        if not isinstance(state_dict, Mapping):
+            raise TypeError(f"Argument state_dict should be a dictionary, but given {type(state_dict)}")
+
+        if not (len(state_dict) == 1 and Metric.__state_dict_key_per_rank in state_dict):
+            raise ValueError(
+                "Incorrect state_dict object. Argument state_dict should be a dictionary "
+                "provided by Metric.state_dict(). "
+                f"Expected single key: {Metric.__state_dict_key_per_rank}, but given {state_dict.keys()}"
+            )
+
+        list_state_dicts_per_rank = state_dict[Metric.__state_dict_key_per_rank]
+        rank = idist.get_rank()
+        world_size = idist.get_world_size()
+        if len(list_state_dicts_per_rank) != world_size:
+            raise ValueError(
+                "Incorrect state_dict object. Argument state_dict should be a dictionary "
+                "provided by Metric.state_dict(). "
+                f"Expected a list of state_dicts of size equal world_size: {world_size}, "
+                f"but got {len(list_state_dicts_per_rank)}"
+            )
+
+        state_dict = list_state_dicts_per_rank[rank]
+        self._load_state_dict_per_rank(state_dict)
 
     def __add__(self, other: Any) -> "MetricsLambda":
         from ignite.metrics.metrics_lambda import MetricsLambda

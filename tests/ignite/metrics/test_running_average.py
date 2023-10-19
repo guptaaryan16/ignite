@@ -1,5 +1,6 @@
-import os
+import warnings
 from functools import partial
+from itertools import accumulate
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ import torch
 import ignite.distributed as idist
 from ignite.engine import Engine, Events
 from ignite.metrics import Accuracy, RunningAverage
+from ignite.metrics.metric import RunningBatchWise, RunningEpochWise, SingleEpochRunningBatchWise
 
 
 def test_wrong_input_args():
@@ -26,171 +28,156 @@ def test_wrong_input_args():
     with pytest.raises(ValueError, match=r"Argument device should be None if src is a Metric"):
         RunningAverage(Accuracy(), device="cpu")
 
+    with pytest.warns(UserWarning, match=r"`epoch_bound` is deprecated and will be removed in the future."):
+        m = RunningAverage(Accuracy(), epoch_bound=True)
 
-def test_integration():
-    n_iters = 100
+
+@pytest.mark.filterwarnings("ignore")
+@pytest.mark.parametrize("epoch_bound, usage", [(False, RunningBatchWise()), (True, SingleEpochRunningBatchWise())])
+def test_epoch_bound(epoch_bound, usage):
+    with warnings.catch_warnings():
+        metric = RunningAverage(output_transform=lambda _: _, epoch_bound=epoch_bound)
+    e1 = Engine(lambda _, __: None)
+    e2 = Engine(lambda _, __: None)
+    metric.attach(e1, "")
+    metric.epoch_bound = None
+    metric.attach(e2, "", usage)
+    e1._event_handlers == e2._event_handlers
+
+
+@pytest.mark.parametrize("usage", [RunningBatchWise(), SingleEpochRunningBatchWise()])
+def test_integration_batchwise(usage):
+    torch.manual_seed(10)
+    alpha = 0.98
+    n_iters = 10
     batch_size = 10
     n_classes = 10
-    y_true_batch_values = iter(np.random.randint(0, n_classes, size=(n_iters, batch_size)))
-    y_pred_batch_values = iter(np.random.rand(n_iters, batch_size, n_classes))
-    loss_values = iter(range(n_iters))
+    max_epochs = 3
+    data = list(range(n_iters))
+    loss = torch.arange(n_iters, dtype=torch.float)
+    y_true = torch.randint(0, n_classes, size=(n_iters, batch_size))
+    y_pred = torch.rand(n_iters, batch_size, n_classes)
 
-    def update_fn(engine, batch):
-        loss_value = next(loss_values)
-        y_true_batch = next(y_true_batch_values)
-        y_pred_batch = next(y_pred_batch_values)
-        return loss_value, torch.from_numpy(y_pred_batch), torch.from_numpy(y_true_batch)
+    accuracy_running_averages = torch.tensor(
+        list(
+            accumulate(
+                map(
+                    lambda y_yp: torch.sum(y_yp[1].argmax(dim=-1) == y_yp[0]).item() / y_yp[0].size(0),
+                    zip(
+                        y_true if isinstance(usage, SingleEpochRunningBatchWise) else y_true.repeat(max_epochs, 1),
+                        y_pred if isinstance(usage, SingleEpochRunningBatchWise) else y_pred.repeat(max_epochs, 1, 1),
+                    ),
+                ),
+                lambda ra, acc: ra * alpha + (1 - alpha) * acc,
+            )
+        )
+    )
+    if isinstance(usage, SingleEpochRunningBatchWise):
+        accuracy_running_averages = accuracy_running_averages.repeat(max_epochs)
+
+    loss_running_averages = torch.tensor(
+        list(
+            accumulate(
+                loss if isinstance(usage, SingleEpochRunningBatchWise) else loss.repeat(max_epochs),
+                lambda ra, loss_item: ra * alpha + (1 - alpha) * loss_item,
+            )
+        )
+    )
+    if isinstance(usage, SingleEpochRunningBatchWise):
+        loss_running_averages = loss_running_averages.repeat(max_epochs)
+
+    def update_fn(_, i):
+        loss_value = loss[i]
+        y_true_batch = y_true[i]
+        y_pred_batch = y_pred[i]
+        return loss_value, y_pred_batch, y_true_batch
 
     trainer = Engine(update_fn)
-    alpha = 0.98
 
     acc_metric = RunningAverage(Accuracy(output_transform=lambda x: [x[1], x[2]]), alpha=alpha)
-    acc_metric.attach(trainer, "running_avg_accuracy")
+    acc_metric.attach(trainer, "running_avg_accuracy", usage)
 
     avg_output = RunningAverage(output_transform=lambda x: x[0], alpha=alpha)
-    avg_output.attach(trainer, "running_avg_output")
+    avg_output.attach(trainer, "running_avg_loss", usage)
 
-    running_avg_acc = [
-        None,
-    ]
-
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def manual_running_avg_acc(engine):
-        _, y_pred, y = engine.state.output
-        indices = torch.max(y_pred, 1)[1]
-        correct = torch.eq(indices, y).view(-1)
-        num_correct = torch.sum(correct).item()
-        num_examples = correct.shape[0]
-        batch_acc = num_correct * 1.0 / num_examples
-        if running_avg_acc[0] is None:
-            running_avg_acc[0] = batch_acc
-        else:
-            running_avg_acc[0] = running_avg_acc[0] * alpha + (1.0 - alpha) * batch_acc
-        engine.state.running_avg_acc = running_avg_acc[0]
-
-    @trainer.on(Events.EPOCH_STARTED)
-    def running_avg_output_init(engine):
-        engine.state.running_avg_output = None
+    metric_acc_running_averages = []
+    metric_loss_running_averages = []
 
     @trainer.on(Events.ITERATION_COMPLETED)
-    def running_avg_output_update(engine):
-        if engine.state.running_avg_output is None:
-            engine.state.running_avg_output = engine.state.output[0]
-        else:
-            engine.state.running_avg_output = (
-                engine.state.running_avg_output * alpha + (1.0 - alpha) * engine.state.output[0]
+    def _(engine):
+        metric_acc_running_averages.append(engine.state.metrics["running_avg_accuracy"])
+        metric_loss_running_averages.append(engine.state.metrics["running_avg_loss"])
+
+    trainer.run(data, max_epochs=3)
+
+    assert (torch.tensor(metric_acc_running_averages) == accuracy_running_averages).all()
+    assert (torch.tensor(metric_loss_running_averages) == loss_running_averages).all()
+
+    metric_state = acc_metric.state_dict()
+    saved__value = acc_metric._value
+    saved_src__num_correct = acc_metric.src._num_correct
+    saved_src__num_examples = acc_metric.src._num_examples
+    acc_metric.reset()
+    acc_metric.load_state_dict(metric_state)
+    assert acc_metric._value == saved__value
+    assert acc_metric.src._num_examples == saved_src__num_examples
+    assert (acc_metric.src._num_correct == saved_src__num_correct).all()
+
+    metric_state = avg_output.state_dict()
+    saved__value = avg_output._value
+    assert avg_output.src is None
+    avg_output.reset()
+    avg_output.load_state_dict(metric_state)
+    assert avg_output._value == saved__value
+    assert avg_output.src is None
+
+
+def test_integration_epochwise():
+    torch.manual_seed(10)
+    alpha = 0.98
+    n_iters = 10
+    batch_size = 10
+    n_classes = 10
+    max_epochs = 3
+    data = list(range(n_iters))
+    y_true = torch.randint(0, n_classes, size=(n_iters, batch_size))
+    y_pred = torch.rand(max_epochs, n_iters, batch_size, n_classes)
+
+    accuracy_running_averages = torch.tensor(
+        list(
+            accumulate(
+                map(
+                    lambda y_pred_epoch: torch.sum(y_pred_epoch.argmax(dim=-1) == y_true).item() / y_true.numel(),
+                    y_pred,
+                ),
+                lambda ra, acc: ra * alpha + (1 - alpha) * acc,
             )
+        )
+    )
 
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def assert_equal_running_avg_acc_values(engine):
-        assert (
-            engine.state.running_avg_acc == engine.state.metrics["running_avg_accuracy"]
-        ), f"{engine.state.running_avg_acc} vs {engine.state.metrics['running_avg_accuracy']}"
-
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def assert_equal_running_avg_output_values(engine):
-        assert (
-            engine.state.running_avg_output == engine.state.metrics["running_avg_output"]
-        ), f"{engine.state.running_avg_output} vs {engine.state.metrics['running_avg_output']}"
-
-    np.random.seed(10)
-    running_avg_acc = [
-        None,
-    ]
-    n_iters = 10
-    batch_size = 10
-    n_classes = 10
-    data = list(range(n_iters))
-    loss_values = iter(range(n_iters))
-    y_true_batch_values = iter(np.random.randint(0, n_classes, size=(n_iters, batch_size)))
-    y_pred_batch_values = iter(np.random.rand(n_iters, batch_size, n_classes))
-    trainer.run(data, max_epochs=1)
-
-    running_avg_acc = [
-        None,
-    ]
-    n_iters = 10
-    batch_size = 10
-    n_classes = 10
-    data = list(range(n_iters))
-    loss_values = iter(range(n_iters))
-    y_true_batch_values = iter(np.random.randint(0, n_classes, size=(n_iters, batch_size)))
-    y_pred_batch_values = iter(np.random.rand(n_iters, batch_size, n_classes))
-    trainer.run(data, max_epochs=1)
-
-
-def test_epoch_unbound():
-    n_iters = 10
-    n_epochs = 3
-    batch_size = 10
-    n_classes = 10
-    data = list(range(n_iters))
-    loss_values = iter(range(2 * n_epochs * n_iters))
-    y_true_batch_values = iter(np.random.randint(0, n_classes, size=(2 * n_epochs * n_iters, batch_size)))
-    y_pred_batch_values = iter(np.random.rand(2 * n_epochs * n_iters, batch_size, n_classes))
-
-    def update_fn(engine, batch):
-        loss_value = next(loss_values)
-        y_true_batch = next(y_true_batch_values)
-        y_pred_batch = next(y_pred_batch_values)
-        return loss_value, torch.from_numpy(y_pred_batch), torch.from_numpy(y_true_batch)
+    def update_fn(engine, i):
+        y_true_batch = y_true[i]
+        y_pred_batch = y_pred[engine.state.epoch - 1, i]
+        return y_pred_batch, y_true_batch
 
     trainer = Engine(update_fn)
-    alpha = 0.98
 
-    acc_metric = RunningAverage(Accuracy(output_transform=lambda x: [x[1], x[2]]), alpha=alpha, epoch_bound=False)
-    acc_metric.attach(trainer, "running_avg_accuracy")
+    acc_metric = RunningAverage(Accuracy(), alpha=alpha)
+    acc_metric.attach(trainer, "running_avg_accuracy", RunningEpochWise())
 
-    avg_output = RunningAverage(output_transform=lambda x: x[0], alpha=alpha, epoch_bound=False)
-    avg_output.attach(trainer, "running_avg_output")
+    metric_acc_running_averages = []
 
-    running_avg_acc = [None]
-
-    trainer.state.running_avg_output = None
-
-    @trainer.on(Events.ITERATION_COMPLETED, running_avg_acc)
-    def manual_running_avg_acc(engine, running_avg_acc):
-        _, y_pred, y = engine.state.output
-        indices = torch.max(y_pred, 1)[1]
-        correct = torch.eq(indices, y).view(-1)
-        num_correct = torch.sum(correct).item()
-        num_examples = correct.shape[0]
-        batch_acc = num_correct * 1.0 / num_examples
-        if running_avg_acc[0] is None:
-            running_avg_acc[0] = batch_acc
-        else:
-            running_avg_acc[0] = running_avg_acc[0] * alpha + (1.0 - alpha) * batch_acc
-        engine.state.running_avg_acc = running_avg_acc[0]
-
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def running_avg_output_update(engine):
-        if engine.state.running_avg_output is None:
-            engine.state.running_avg_output = engine.state.output[0]
-        else:
-            engine.state.running_avg_output = (
-                engine.state.running_avg_output * alpha + (1.0 - alpha) * engine.state.output[0]
-            )
-
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def assert_equal_running_avg_acc_values(engine):
-        assert (
-            engine.state.running_avg_acc == engine.state.metrics["running_avg_accuracy"]
-        ), f"{engine.state.running_avg_acc} vs {engine.state.metrics['running_avg_accuracy']}"
-
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def assert_equal_running_avg_output_values(engine):
-        assert (
-            engine.state.running_avg_output == engine.state.metrics["running_avg_output"]
-        ), f"{engine.state.running_avg_output} vs {engine.state.metrics['running_avg_output']}"
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def _(engine):
+        metric_acc_running_averages.append(engine.state.metrics["running_avg_accuracy"])
 
     trainer.run(data, max_epochs=3)
 
-    running_avg_acc[0] = None
-    trainer.state.running_avg_output = None
-    trainer.run(data, max_epochs=3)
+    assert (torch.tensor(metric_acc_running_averages) == accuracy_running_averages).all()
 
 
-def test_multiple_attach():
+@pytest.mark.parametrize("usage", [RunningBatchWise(), SingleEpochRunningBatchWise(), RunningEpochWise()])
+def test_multiple_attach(usage):
     n_iters = 100
     errD_values = iter(np.random.rand(n_iters))
     errG_values = iter(np.random.rand(n_iters))
@@ -214,9 +201,9 @@ def test_multiple_attach():
     monitoring_metrics = ["errD", "errG", "D_x", "D_G_z1", "D_G_z2"]
     for metric in monitoring_metrics:
         foo = partial(lambda x, metric: x[metric], metric=metric)
-        RunningAverage(alpha=alpha, output_transform=foo).attach(trainer, metric)
+        RunningAverage(alpha=alpha, output_transform=foo).attach(trainer, metric, usage)
 
-    @trainer.on(Events.ITERATION_COMPLETED)
+    @trainer.on(usage.COMPLETED)
     def check_values(engine):
         values = []
         for metric in monitoring_metrics:
@@ -227,6 +214,22 @@ def test_multiple_attach():
 
     data = list(range(n_iters))
     trainer.run(data)
+
+
+@pytest.mark.filterwarnings("ignore")
+@pytest.mark.parametrize("epoch_bound", [True, False, None])
+@pytest.mark.parametrize("src", [Accuracy(), None])
+@pytest.mark.parametrize("usage", [RunningBatchWise(), SingleEpochRunningBatchWise(), RunningEpochWise()])
+def test_detach(epoch_bound, src, usage):
+    with warnings.catch_warnings():
+        m = RunningAverage(src, output_transform=(lambda _: _) if src is None else None, epoch_bound=epoch_bound)
+    e = Engine(lambda _, __: None)
+    m.attach(e, "m", usage)
+    for event_handlers in e._event_handlers.values():
+        assert len(event_handlers) != 0
+    m.detach(e, usage)
+    for event_handlers in e._event_handlers.values():
+        assert len(event_handlers) == 0
 
 
 def test_output_is_tensor():
@@ -247,213 +250,147 @@ def test_output_is_tensor():
     assert not v.requires_grad
 
 
-def _test_distrib_on_output(device):
-    rank = idist.get_rank()
-    n_iters = 10
-    n_epochs = 3
-    batch_size = 10
+@pytest.mark.usefixtures("distributed")
+class TestDistributed:
+    @pytest.mark.parametrize("usage", [RunningBatchWise(), SingleEpochRunningBatchWise()])
+    def test_src_is_output(self, usage):
+        device = idist.device()
+        rank = idist.get_rank()
+        n_iters = 10
+        n_epochs = 3
 
-    # Data per rank
-    data = list(range(n_iters))
-    k = n_epochs * batch_size * n_iters
-    all_loss_values = torch.arange(0, k * idist.get_world_size(), dtype=torch.float64).to(device)
-    loss_values = iter(all_loss_values[k * rank : k * (rank + 1)])
-
-    def update_fn(engine, batch):
-        loss_value = next(loss_values)
-        return loss_value.item()
-
-    trainer = Engine(update_fn)
-    alpha = 0.98
-
-    metric_device = idist.device() if torch.device(device).type != "xla" else "cpu"
-    avg_output = RunningAverage(output_transform=lambda x: x, alpha=alpha, epoch_bound=False, device=metric_device)
-    avg_output.attach(trainer, "running_avg_output")
-
-    @trainer.on(Events.STARTED)
-    def running_avg_output_init(engine):
-        engine.state.running_avg_output = None
-
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def running_avg_output_update(engine):
-        i = engine.state.iteration - 1
-        o = sum([all_loss_values[i + j * k] for j in range(idist.get_world_size())]).item()
-        o /= idist.get_world_size()
-        if engine.state.running_avg_output is None:
-            engine.state.running_avg_output = o
-        else:
-            engine.state.running_avg_output = engine.state.running_avg_output * alpha + (1.0 - alpha) * o
-
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def assert_equal_running_avg_output_values(engine):
-        it = engine.state.iteration
-        assert engine.state.running_avg_output == pytest.approx(
-            engine.state.metrics["running_avg_output"]
-        ), f"{it}: {engine.state.running_avg_output} vs {engine.state.metrics['running_avg_output']}"
-
-    trainer.run(data, max_epochs=3)
-
-
-def _test_distrib_on_metric(device):
-    rank = idist.get_rank()
-    n_iters = 10
-    n_epochs = 3
-    batch_size = 10
-    n_classes = 10
-
-    def _test(metric_device):
+        # Data per rank
         data = list(range(n_iters))
-        np.random.seed(12)
-        all_y_true_batch_values = np.random.randint(
-            0, n_classes, size=(idist.get_world_size(), n_epochs * n_iters, batch_size)
-        )
-        all_y_pred_batch_values = np.random.rand(idist.get_world_size(), n_epochs * n_iters, batch_size, n_classes)
-
-        y_true_batch_values = iter(all_y_true_batch_values[rank, ...])
-        y_pred_batch_values = iter(all_y_pred_batch_values[rank, ...])
+        rank_loss_count = n_epochs * n_iters
+        all_loss_values = torch.arange(0, rank_loss_count * idist.get_world_size(), dtype=torch.float64).to(device)
+        loss_values = iter(all_loss_values[rank_loss_count * rank : rank_loss_count * (rank + 1)])
 
         def update_fn(engine, batch):
-            y_true_batch = next(y_true_batch_values)
-            y_pred_batch = next(y_pred_batch_values)
-            return torch.from_numpy(y_pred_batch), torch.from_numpy(y_true_batch)
+            loss_value = next(loss_values)
+            return loss_value.item()
 
         trainer = Engine(update_fn)
         alpha = 0.98
 
-        acc_metric = RunningAverage(
-            Accuracy(output_transform=lambda x: [x[0], x[1]], device=metric_device), alpha=alpha, epoch_bound=False
-        )
-        acc_metric.attach(trainer, "running_avg_accuracy")
+        metric_device = device if device.type != "xla" else "cpu"
+        avg_output = RunningAverage(output_transform=lambda x: x, alpha=alpha, device=metric_device)
+        avg_output.attach(trainer, "running_avg_output", usage)
 
-        running_avg_acc = [
-            None,
-        ]
-        true_acc_metric = Accuracy(device=metric_device)
+        @trainer.on(usage.STARTED)
+        def reset_running_avg_output(engine):
+            engine.state.running_avg_output = None
 
-        @trainer.on(Events.ITERATION_COMPLETED)
-        def manual_running_avg_acc(engine):
+        @trainer.on(usage.ITERATION_COMPLETED)
+        def running_avg_output_update(engine):
             i = engine.state.iteration - 1
-
-            true_acc_metric.reset()
-            for j in range(idist.get_world_size()):
-                output = (
-                    torch.from_numpy(all_y_pred_batch_values[j, i, :, :]),
-                    torch.from_numpy(all_y_true_batch_values[j, i, :]),
-                )
-                true_acc_metric.update(output)
-
-            batch_acc = true_acc_metric._num_correct.item() * 1.0 / true_acc_metric._num_examples
-
-            if running_avg_acc[0] is None:
-                running_avg_acc[0] = batch_acc
+            o = sum([all_loss_values[i + r * rank_loss_count] for r in range(idist.get_world_size())]).item()
+            o /= idist.get_world_size()
+            if engine.state.running_avg_output is None:
+                engine.state.running_avg_output = o
             else:
-                running_avg_acc[0] = running_avg_acc[0] * alpha + (1.0 - alpha) * batch_acc
-            engine.state.running_avg_acc = running_avg_acc[0]
+                engine.state.running_avg_output = engine.state.running_avg_output * alpha + (1.0 - alpha) * o
 
-        @trainer.on(Events.ITERATION_COMPLETED)
-        def assert_equal_running_avg_acc_values(engine):
+        @trainer.on(usage.COMPLETED)
+        def assert_equal_running_avg_output_values(engine):
+            it = engine.state.iteration
             assert (
-                engine.state.running_avg_acc == engine.state.metrics["running_avg_accuracy"]
-            ), f"{engine.state.running_avg_acc} vs {engine.state.metrics['running_avg_accuracy']}"
+                engine.state.running_avg_output == engine.state.metrics["running_avg_output"]
+            ), f"{it}: {engine.state.running_avg_output} vs {engine.state.metrics['running_avg_output']}"
 
         trainer.run(data, max_epochs=3)
 
-    _test("cpu")
-    if device.type != "xla":
-        _test(idist.device())
+    @pytest.mark.parametrize("usage", [RunningBatchWise(), SingleEpochRunningBatchWise(), RunningEpochWise()])
+    def test_src_is_metric(self, usage):
+        device = idist.device()
+        rank = idist.get_rank()
+        n_iters = 10
+        n_epochs = 3
+        batch_size = 10
+        n_classes = 10
 
+        def _test(metric_device):
+            data = list(range(n_iters))
+            np.random.seed(12)
+            all_y_true_batch_values = np.random.randint(
+                0, n_classes, size=(idist.get_world_size(), n_epochs * n_iters, batch_size)
+            )
+            all_y_pred_batch_values = np.random.rand(idist.get_world_size(), n_epochs * n_iters, batch_size, n_classes)
 
-def _test_distrib_accumulator_device(device):
-    metric_devices = [torch.device("cpu")]
-    if device.type != "xla":
-        metric_devices.append(idist.device())
-    for metric_device in metric_devices:
-        # Don't test the src=Metric case because compute() returns a scalar,
-        # so the metric doesn't accumulate on the device specified
-        avg = RunningAverage(output_transform=lambda x: x, device=metric_device)
-        assert avg._device == metric_device
-        # Value is None until the first update then compute call
+            y_true_batch_values = iter(all_y_true_batch_values[rank, ...])
+            y_pred_batch_values = iter(all_y_pred_batch_values[rank, ...])
 
-        for _ in range(3):
-            avg.update(torch.tensor(1.0, device=device))
-            avg.compute()
+            def update_fn(engine, batch):
+                y_true_batch = next(y_true_batch_values)
+                y_pred_batch = next(y_pred_batch_values)
+                return torch.from_numpy(y_pred_batch), torch.from_numpy(y_true_batch)
 
-            assert (
-                avg._value.device == metric_device
-            ), f"{type(avg._value.device)}:{avg._value.device} vs {type(metric_device)}:{metric_device}"
+            trainer = Engine(update_fn)
+            alpha = 0.98
 
+            acc_metric = RunningAverage(Accuracy(device=metric_device), alpha=alpha)
+            acc_metric.attach(trainer, "running_avg_accuracy", usage)
 
-@pytest.mark.distributed
-@pytest.mark.skipif(not idist.has_native_dist_support, reason="Skip if no native dist support")
-@pytest.mark.skipif(torch.cuda.device_count() < 1, reason="Skip if no GPU")
-def test_distrib_nccl_gpu(distributed_context_single_node_nccl):
-    device = idist.device()
-    _test_distrib_on_output(device)
-    _test_distrib_on_metric(device)
-    _test_distrib_accumulator_device(device)
+            running_avg_acc = [
+                None,
+            ]
+            true_acc_metric = Accuracy(device=metric_device)
 
+            @trainer.on(Events.ITERATION_COMPLETED)
+            def manual_running_avg_acc(engine):
+                iteration = engine.state.iteration
 
-@pytest.mark.distributed
-@pytest.mark.skipif(not idist.has_native_dist_support, reason="Skip if no native dist support")
-def test_distrib_gloo_cpu_or_gpu(distributed_context_single_node_gloo):
-    device = idist.device()
-    _test_distrib_on_output(device)
-    _test_distrib_on_metric(device)
-    _test_distrib_accumulator_device(device)
+                if not isinstance(usage, RunningEpochWise) or ((iteration - 1) % n_iters) == 0:
+                    true_acc_metric.reset()
+                if ((iteration - 1) % n_iters) == 0 and isinstance(usage, SingleEpochRunningBatchWise):
+                    running_avg_acc[0] = None
+                for j in range(idist.get_world_size()):
+                    output = (
+                        torch.from_numpy(all_y_pred_batch_values[j, iteration - 1, :, :]),
+                        torch.from_numpy(all_y_true_batch_values[j, iteration - 1, :]),
+                    )
+                    true_acc_metric.update(output)
 
+                if not isinstance(usage, RunningEpochWise) or (iteration % n_iters) == 0:
+                    batch_acc = true_acc_metric._num_correct.item() * 1.0 / true_acc_metric._num_examples
 
-@pytest.mark.distributed
-@pytest.mark.skipif(not idist.has_hvd_support, reason="Skip if no Horovod dist support")
-@pytest.mark.skipif("WORLD_SIZE" in os.environ, reason="Skip if launched as multiproc")
-def test_distrib_hvd(gloo_hvd_executor):
-    device = torch.device("cpu" if not torch.cuda.is_available() else "cuda")
-    nproc = 4 if not torch.cuda.is_available() else torch.cuda.device_count()
+                    if running_avg_acc[0] is None:
+                        running_avg_acc[0] = batch_acc
+                    else:
+                        running_avg_acc[0] = running_avg_acc[0] * alpha + (1.0 - alpha) * batch_acc
+                    engine.state.running_avg_acc = running_avg_acc[0]
 
-    gloo_hvd_executor(_test_distrib_on_output, (device,), np=nproc, do_init=True)
-    gloo_hvd_executor(_test_distrib_on_metric, (device,), np=nproc, do_init=True)
-    gloo_hvd_executor(_test_distrib_accumulator_device, (device,), np=nproc, do_init=True)
+            @trainer.on(Events.ITERATION_COMPLETED)
+            def assert_equal_running_avg_acc_values(engine):
+                print(engine.state.iteration)
+                if not isinstance(usage, RunningEpochWise) or (
+                    (engine.state.iteration > 1) and ((engine.state.iteration % n_iters) == 1)
+                ):
+                    assert (
+                        engine.state.running_avg_acc == engine.state.metrics["running_avg_accuracy"]
+                    ), f"{engine.state.running_avg_acc} vs {engine.state.metrics['running_avg_accuracy']}"
 
+            trainer.run(data, max_epochs=3)
 
-@pytest.mark.multinode_distributed
-@pytest.mark.skipif(not idist.has_native_dist_support, reason="Skip if no native dist support")
-@pytest.mark.skipif("MULTINODE_DISTRIB" not in os.environ, reason="Skip if not multi-node distributed")
-def test_multinode_distrib_gloo_cpu_or_gpu(distributed_context_multi_node_gloo):
-    device = idist.device()
-    _test_distrib_on_output(device)
-    _test_distrib_on_metric(device)
-    _test_distrib_accumulator_device(device)
+        _test("cpu")
+        if device.type != "xla":
+            _test(idist.device())
 
+    def test_accumulator_device(self):
+        device = idist.device()
+        metric_devices = [torch.device("cpu")]
+        if device.type != "xla":
+            metric_devices.append(idist.device())
+        for metric_device in metric_devices:
+            # Don't test the src=Metric case because compute() returns a scalar,
+            # so the metric doesn't accumulate on the device specified
+            avg = RunningAverage(output_transform=lambda x: x, device=metric_device)
+            assert avg._device == metric_device
+            # Value is None until the first update then compute call
 
-@pytest.mark.multinode_distributed
-@pytest.mark.skipif(not idist.has_native_dist_support, reason="Skip if no native dist support")
-@pytest.mark.skipif("GPU_MULTINODE_DISTRIB" not in os.environ, reason="Skip if not multi-node distributed")
-def test_multinode_distrib_nccl_gpu(distributed_context_multi_node_nccl):
-    device = idist.device()
-    _test_distrib_on_output(device)
-    _test_distrib_on_metric(device)
-    _test_distrib_accumulator_device(device)
+            for _ in range(3):
+                avg.update(torch.tensor(1.0, device=device))
+                avg.compute()
 
-
-@pytest.mark.tpu
-@pytest.mark.skipif("NUM_TPU_WORKERS" in os.environ, reason="Skip if NUM_TPU_WORKERS is in env vars")
-@pytest.mark.skipif(not idist.has_xla_support, reason="Skip if no PyTorch XLA package")
-def test_distrib_single_device_xla():
-    device = idist.device()
-    _test_distrib_on_output(device)
-    _test_distrib_on_metric(device)
-    _test_distrib_accumulator_device(device)
-
-
-def _test_distrib_xla_nprocs(index):
-    device = idist.device()
-    _test_distrib_on_output(device)
-    _test_distrib_on_metric(device)
-    _test_distrib_accumulator_device(device)
-
-
-@pytest.mark.tpu
-@pytest.mark.skipif("NUM_TPU_WORKERS" not in os.environ, reason="Skip if no NUM_TPU_WORKERS in env vars")
-@pytest.mark.skipif(not idist.has_xla_support, reason="Skip if no PyTorch XLA package")
-def test_distrib_xla_nprocs(xmp_executor):
-    n = int(os.environ["NUM_TPU_WORKERS"])
-    xmp_executor(_test_distrib_xla_nprocs, args=(), nprocs=n)
+                assert (
+                    avg._value.device == metric_device
+                ), f"{type(avg._value.device)}:{avg._value.device} vs {type(metric_device)}:{metric_device}"
